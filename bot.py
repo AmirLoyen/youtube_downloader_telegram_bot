@@ -42,8 +42,8 @@ except ImportError:
     scrapetube = None
 
 # ==================== CONFIG ====================
-TOKEN = os.environ.get('BOT_TOKEN', '8832840308:AAERG8el8xWUhFGMivuEZiVAV42exmMMFNk')
-if TOKEN == '8832840308:AAERG8el8xWUhFGMivuEZiVAV42exmMMFNk':
+TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
+if TOKEN == 'YOUR_BOT_TOKEN_HERE':
     print("❌ Please set BOT_TOKEN in environment variables!")
     exit(1)
 
