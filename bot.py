@@ -1,15 +1,40 @@
 import os
 import subprocess
+import sys
 import json
 import traceback
 from telegram import Update, ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes, ConversationHandler
 
+# ==================== AUTO INSTALL FFMPEG ====================
+def ensure_ffmpeg():
+    """Check and auto-install FFmpeg"""
+    try:
+        subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+        print("✅ FFmpeg found!")
+        return True
+    except:
+        print("⚠️ FFmpeg not found! Installing...")
+        try:
+            subprocess.run(['apt-get', 'update', '-qq'], capture_output=True, timeout=30)
+            subprocess.run(['apt-get', 'install', '-y', '-qq', 'ffmpeg'], capture_output=True, timeout=60)
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
+            print("✅ FFmpeg installed!")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to install FFmpeg: {e}")
+            return False
+
+if not ensure_ffmpeg():
+    print("⚠️ FFmpeg not available. Bot may not work properly.")
+
 # ==================== CONFIG ====================
-TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-if TOKEN == 'YOUR_BOT_TOKEN_HERE':
-    print("❌ Please set BOT_TOKEN environment variable!")
+TOKEN = os.environ.get('BOT_TOKEN', '')
+if not TOKEN:
+    print("❌ BOT_TOKEN not set!")
     exit(1)
+
+PORT = int(os.environ.get('PORT', 8080))
 
 # ==================== STATES ====================
 WAITING_VIDEO = 1
@@ -33,28 +58,24 @@ def settings_menu(user_id):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"🔊 Audio: {'✅ ON' if s['audio'] else '❌ OFF'}", callback_data='audio')],
         [InlineKeyboardButton(f"⏱ Duration: {s['max_duration']}s", callback_data='duration')],
-        [InlineKeyboardButton(f"📦 Size: {s['max_size']}MB", callback_data='size')],
+        [InlineKeyboardButton(f"📦 Max Size: {s['max_size']}MB", callback_data='size')],
         [InlineKeyboardButton(f"🖼 Crop: {s['crop_mode']}", callback_data='crop')],
-        [InlineKeyboardButton("🔄 Reset", callback_data='reset')],
+        [InlineKeyboardButton("🔄 Reset Defaults", callback_data='reset')],
     ])
 
 main_kb = ReplyKeyboardMarkup([
-    ['⚙️ Settings', '📹 Convert'],
-    ['📊 My Stats', '❌ Cancel']
+    ['⚙️ Settings', '📹 Convert Video'],
+    ['🖼 Photo to VN', '📊 My Stats'],
+    ['❌ Cancel']
 ], resize_keyboard=True)
 
-# ==================== FFMPEG ====================
-def check_ffmpeg():
-    try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
-        return True
-    except:
-        return False
-
+# ==================== FFMPEG HELPERS ====================
 def get_video_info(path):
     info = {'duration': 0, 'width': 0, 'height': 0, 'has_audio': False}
     try:
-        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration:stream=width,height,codec_type', '-of', 'json', path]
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 
+               'format=duration:stream=width,height,codec_type', 
+               '-of', 'json', path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         data = json.loads(result.stdout)
         for stream in data.get('streams', []):
@@ -71,7 +92,6 @@ def get_video_info(path):
 def convert_video(input_path, output_path, user_id):
     s = get_settings(user_id)
     
-    # Crop filter
     if s['crop_mode'] == 'fill':
         vf = 'scale=360:360:force_original_aspect_ratio=increase,crop=360:360,setsar=1'
     elif s['crop_mode'] == 'stretch':
@@ -104,7 +124,6 @@ def convert_video(input_path, output_path, user_id):
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             
             if size_mb > s['max_size']:
-                # Retry with more compression
                 cmd2 = [
                     'ffmpeg', '-i', input_path,
                     '-vf', vf,
@@ -149,15 +168,12 @@ def photo_to_vn(input_path, output_path, user_id):
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not check_ffmpeg():
-        await update.message.reply_text('❌ FFmpeg not installed! Contact admin.')
-        return ConversationHandler.END
-    
     await update.message.reply_text(
         '📹 **Video → Video Message Converter**\n\n'
-        '• Send a video to convert\n'
-        '• Send a photo to make VN\n'
-        '• Use ⚙️ Settings to customize\n\n'
+        'Send me a video or photo to convert!\n\n'
+        '• 🎬 Video → Round Video Message\n'
+        '• 🖼 Photo → Video Message with zoom\n\n'
+        'Use ⚙️ **Settings** to customize:\n'
         '🔊 Audio | ⏱ Duration | 📦 Size | 🖼 Crop',
         reply_markup=main_kb
     )
@@ -170,8 +186,8 @@ async def settings_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f'⚙️ **Current Settings**\n\n'
         f'🔊 Audio: {"✅ ON" if s["audio"] else "❌ OFF"}\n'
-        f'⏱ Max Duration: {s["max_duration"]}s\n'
-        f'📦 Max Size: {s["max_size"]}MB\n'
+        f'⏱ Max Duration: {s["max_duration"]} seconds\n'
+        f'📦 Max Size: {s["max_size"]} MB\n'
         f'🖼 Crop Mode: {s["crop_mode"]}\n\n'
         f'Tap a button to change:'
     )
@@ -208,8 +224,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f'⚙️ **Current Settings**\n\n'
         f'🔊 Audio: {"✅ ON" if s["audio"] else "❌ OFF"}\n'
-        f'⏱ Max Duration: {s["max_duration"]}s\n'
-        f'📦 Max Size: {s["max_size"]}MB\n'
+        f'⏱ Max Duration: {s["max_duration"]} seconds\n'
+        f'📦 Max Size: {s["max_size"]} MB\n'
         f'🖼 Crop Mode: {s["crop_mode"]}'
     )
     
@@ -220,7 +236,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     s = get_settings(user.id)
     
-    # Get file
     file_id = None
     duration = 0
     
@@ -233,12 +248,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_id = msg.animation.file_id
         duration = msg.animation.duration
     elif msg.video_note:
-        await msg.reply_text('✅ Already a video message!')
+        await msg.reply_text('✅ Already a video message! Send a regular video to convert.')
         return WAITING_VIDEO
     else:
         return WAITING_VIDEO
     
-    status = await msg.reply_text('⬇️ Downloading...')
+    status = await msg.reply_text('⬇️ Downloading video...')
     
     input_path = f'input_{user.id}.mp4'
     output_path = f'output_{user.id}.mp4'
@@ -250,10 +265,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info = get_video_info(input_path)
         
         if info['duration'] > s['max_duration']:
-            await status.edit_text(f'⚠️ Trimming to {s["max_duration"]}s...')
+            await status.edit_text(f'⚠️ Video is {info["duration"]:.0f}s. Trimming to {s["max_duration"]}s...')
         
-        audio_text = 'with 🔊' if (s['audio'] and info['has_audio']) else 'no 🔊'
-        await status.edit_text(f'🔄 Converting ({audio_text})...')
+        audio_text = 'with 🔊 audio' if (s['audio'] and info['has_audio']) else 'without 🔊 audio'
+        await status.edit_text(f'🔄 Converting {audio_text}...\n🖼 Mode: {s["crop_mode"]}')
         
         result = convert_video(input_path, output_path, user.id)
         
@@ -261,9 +276,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             size_mb = os.path.getsize(result) / (1024 * 1024)
             
             if size_mb > s['max_size']:
-                await status.edit_text(f'⚠️ {size_mb:.1f}MB exceeds {s["max_size"]}MB limit!')
+                await status.edit_text(
+                    f'⚠️ Result is {size_mb:.1f}MB (limit: {s["max_size"]}MB).\n'
+                    'Increase max size in ⚙️ Settings or try a shorter video.'
+                )
             else:
-                await status.edit_text('📤 Sending...')
+                await status.edit_text('📤 Sending video message...')
                 
                 with open(result, 'rb') as f:
                     await msg.reply_video_note(
@@ -274,11 +292,15 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await status.delete()
                 
                 await msg.reply_text(
-                    f'✅ **Done!**\n📦 {size_mb:.1f}MB | ⏱ {min(int(info["duration"]), s["max_duration"])}s | 🔊 {"ON" if s["audio"] else "OFF"}',
+                    f'✅ **Done!**\n'
+                    f'📦 Size: {size_mb:.1f}MB\n'
+                    f'⏱ Duration: {min(int(info["duration"]), s["max_duration"])}s\n'
+                    f'🔊 Audio: {"ON" if s["audio"] and info["has_audio"] else "OFF"}\n'
+                    f'🖼 Crop: {s["crop_mode"]}',
                     reply_markup=main_kb
                 )
         else:
-            await status.edit_text('❌ Conversion failed!')
+            await status.edit_text('❌ Conversion failed! Try a different video or check FFmpeg installation.')
     
     except Exception as e:
         await status.edit_text(f'❌ Error: {str(e)[:100]}')
@@ -286,8 +308,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         for p in [input_path, output_path]:
             try:
-                if os.path.exists(p): os.remove(p)
-            except: pass
+                if os.path.exists(p):
+                    os.remove(p)
+            except:
+                pass
     
     return WAITING_VIDEO
 
@@ -295,7 +319,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.message
     
-    status = await msg.reply_text('🔄 Converting photo...')
+    status = await msg.reply_text('🔄 Converting photo to video message...')
     
     input_path = f'photo_{user.id}.jpg'
     output_path = f'photo_{user.id}.mp4'
@@ -311,9 +335,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(result, 'rb') as f:
                 await msg.reply_video_note(video_note=f, duration=4, length=360)
             await status.delete()
-            await msg.reply_text('✅ Done!', reply_markup=main_kb)
+            await msg.reply_text('✅ Photo converted to video message!', reply_markup=main_kb)
         else:
-            await status.edit_text('❌ Failed!')
+            await status.edit_text('❌ Conversion failed! Make sure FFmpeg is installed.')
     
     except Exception as e:
         await status.edit_text(f'❌ Error: {str(e)[:100]}')
@@ -321,8 +345,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         for p in [input_path, output_path]:
             try:
-                if os.path.exists(p): os.remove(p)
-            except: pass
+                if os.path.exists(p):
+                    os.remove(p)
+            except:
+                pass
     
     return WAITING_VIDEO
 
@@ -333,31 +359,29 @@ async def stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f'📊 **Your Settings**\n\n'
         f'🔊 Audio: {"ON" if s["audio"] else "OFF"}\n'
-        f'⏱ Duration: {s["max_duration"]}s\n'
-        f'📦 Size: {s["max_size"]}MB\n'
-        f'🖼 Crop: {s["crop_mode"]}',
+        f'⏱ Max Duration: {s["max_duration"]}s\n'
+        f'📦 Max Size: {s["max_size"]}MB\n'
+        f'🖼 Crop Mode: {s["crop_mode"]}',
         reply_markup=main_kb
     )
     return WAITING_VIDEO
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('👋 Bye! /start')
+    await update.message.reply_text('👋 Goodbye! Send /start to begin again.')
     return ConversationHandler.END
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     print(f"Error: {context.error}")
+    print(traceback.format_exc())
     if update and hasattr(update, 'message') and update.message:
-        await update.message.reply_text('❌ An error occurred. /start again.')
+        try:
+            await update.message.reply_text('❌ An error occurred. Please try /start again.')
+        except:
+            pass
 
 # ==================== MAIN ====================
 def main():
-    if not check_ffmpeg():
-        print("❌ FFmpeg is required!")
-        print("   Linux: apt install ffmpeg")
-        print("   macOS: brew install ffmpeg")
-        exit(1)
-    
-    print('🤖 Starting Video Note Converter...')
+    print('🤖 Starting Video Note Converter Bot...')
     
     app = Application.builder().token(TOKEN).build()
     
@@ -369,7 +393,8 @@ def main():
                 MessageHandler(filters.PHOTO, handle_photo),
                 MessageHandler(filters.Regex('(?i)^⚙️ Settings$'), settings_handler),
                 MessageHandler(filters.Regex('(?i)^📊 My Stats$'), stats_handler),
-                MessageHandler(filters.Regex('(?i)^📹 Convert$'), start),
+                MessageHandler(filters.Regex('(?i)^📹 Convert Video$'), start),
+                MessageHandler(filters.Regex('(?i)^🖼 Photo to VN$'), start),
                 CommandHandler('start', start),
             ],
         },
@@ -385,7 +410,6 @@ def main():
     
     print('✅ Bot is running...')
     
-    # Just polling - no webhook
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
