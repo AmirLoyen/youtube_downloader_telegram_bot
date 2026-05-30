@@ -1,0 +1,10 @@
+[build]
+builder = "nixpacks"
+buildCommand = "pip install -r requirements.txt"
+
+[build.nixpacks]
+packages = ["ffmpeg"]
+
+[deploy]
+startCommand = "python bot.py"
+restartPolicyType = "ON_FAILURE"
