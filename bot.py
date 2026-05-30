@@ -1,292 +1,420 @@
-import telegram
-from telegram.ext import Updater,CommandHandler,MessageHandler,Filters,ConversationHandler
-import os, shutil
-from telegram import ReplyKeyboardRemove, ReplyKeyboardMarkup
-from youtube import *
+import os
+import re
+import shutil
 import threading
+import asyncio
+from telegram import Update, ReplyKeyboardRemove, ReplyKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    filters,
+    ContextTypes
+)
+from telegram.error import TimedOut, NetworkError
 
-# find port of server 
-PORT = int(os.environ.get('PORT',5000))
-token = '8832840308:AAERG8el8xWUhFGMivuEZiVAV42exmMMFNk'
+# ==================== YOUTUBE FUNCTIONS ====================
+import yt_dlp
+from pytube import YouTube, Search
+import scrapetube
+from bs4 import BeautifulSoup
+import requests
 
-START_CO, GET_WORD, GET_NUMBER,GET_CHANNEL_URL, GET_URL, CONFIRMATION = range(1, 7)
-
-reply_keyboeard_start = [['Download entire channel'],['Download with searching word'], ['Download one video'], ['See processes'], ['exit']]
-markup_start = ReplyKeyboardMarkup(reply_keyboeard_start,resize_keyboard=True, one_time_keyboard=True)
-
-reply_keyboeard_back = [['back', '🏠 home', 'exit']]
-markup_back = ReplyKeyboardMarkup(reply_keyboeard_back,resize_keyboard=True, one_time_keyboard=True)
-
-reply_keyboeard_confirmation = [['I confirm'], ['🏠 home', 'exit']]
-markup_confirmation = ReplyKeyboardMarkup(reply_keyboeard_confirmation,resize_keyboard=True, one_time_keyboard=True)
-
-
-
-def start(update,context):
-    update.message.reply_text('Choose between options : ', reply_markup = markup_start)
-    return(START_CO)
-
-def start_co(update, context):
-    user = update.message.from_user
-    text = update.message.text
-
-    remake_folder(str(user.id))
-
-    if text == 'Download entire channel':
-        update.message.reply_text('Enter URL of one video on channel you want to download all of that videos.', reply_markup = markup_back)
-        return(GET_CHANNEL_URL)
-
-    elif text == 'Download with searching word':
-        update.message.reply_text('Enter word you want to search.', reply_markup = markup_back)
-        return(GET_WORD)
-
-    elif text == 'Download one video':
-        update.message.reply_text('Enter link of that video.', reply_markup = markup_back)
-        return(GET_URL)
-
-def get_channel_url(update,context):
-    user_data = context.user_data
-    text = update.message.text
-
-    if text == 'back':
-        update.message.reply_text('Choose ...', reply_markup = markup_start)
-        return(START_CO)
-    id = find_channel_id(text)
-    if id :
-        list_of_urls = get_videos_from_channel(id)
-        if list_of_urls:
-            user_data['list_of_urls'] = list_of_urls
-            update.message.reply_text(f'There is {len(list_of_urls)} videos on this channel', reply_markup = markup_confirmation)
-            return(CONFIRMATION)
-    else:
-        update.message.reply_text('Can not find id of channel', reply_markup = markup_start)
-        return(START_CO)
-
-def get_word_for_search(update, context):
-    user_data = context.user_data
-    text = update.message.text
-
-    if text == 'back':
-        update.message.reply_text('Choose ...', reply_markup = markup_start)
-        return(START_CO)
-    
-    user_data['search_word'] = text
-    update.message.reply_text('How many videos you wanna download ?', reply_markup = markup_back)
-    return(GET_NUMBER)
-
-def get_number_of_videos(update, context):
-    user_data = context.user_data
-    number = update.message.text
-
-    if number == 'back':
-        update.message.reply_text('Enter word you want to search.', reply_markup = markup_back)
-        return(GET_WORD)
-    
+def find_channel_id(url):
+    """Extract channel ID from YouTube URL"""
     try:
-        number = int(number)
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            return info.get('channel_id') or info.get('uploader_id')
     except:
-        update.message.reply_text('Wrong input', reply_markup = markup_back)
-        return(GET_NUMBER) 
+        return None
 
-    list_of_urls = find_videos_with_search(user_data['search_word'], number)
-    if list_of_urls:
-        user_data['list_of_urls'] = list_of_urls
-    
-    text = f'''
-    Search word : {user_data['search_word']}
-    Number of videos : {number}
-    If it is ok pleas confirm.'''
-    update.message.reply_text(text, reply_markup = markup_confirmation)
-    return(CONFIRMATION)
-
-def one_video_download(update, context):
-    user = update.message.from_user
-    text = update.message.text
-    url = text.strip()
-
-    if text == 'back':
-        update.message.reply_text('Choose ...', reply_markup = markup_start)
-        return(START_CO)
-
+def get_videos_from_channel(channel_id):
+    """Get all videos from a channel"""
     try:
-        status = Download(url, user.id)
-        if status:
-            update.message.reply_video(video = open(status, 'rb'), reply_markup = markup_start)
-            # os.remove(status)
-            return(START_CO)
-        else:
-            update.message.reply_text(f"could not download the video {url}", reply_markup = markup_start)
-            return(START_CO)
+        videos = scrapetube.get_channel(channel_id)
+        result = []
+        for video in videos:
+            result.append({
+                'url': f"https://youtube.com/watch?v={video['videoId']}",
+                'title': video.get('title', {}).get('runs', [{}])[0].get('text', 'Unknown')
+            })
+        return result
     except:
-        update.message.reply_text(f"could not download {url}", reply_markup = markup_start)
-        return(START_CO)
+        return []
+
+def find_videos_with_search(word, number):
+    """Search YouTube and return video URLs"""
+    try:
+        search = Search(word)
+        results = []
+        count = 0
+        for video in search.results:
+            if count >= number:
+                break
+            results.append({
+                'url': video.watch_url,
+                'title': video.title
+            })
+            count += 1
+        return results
+    except:
+        return []
+
+def Download(url, user_id):
+    """Download a single YouTube video"""
+    try:
+        folder = f'Downloads/{user_id}'
+        os.makedirs(folder, exist_ok=True)
         
+        ydl_opts = {
+            'format': 'best[height<=720]',
+            'outtmpl': f'{folder}/%(title)s.%(ext)s',
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            
+            # Find the actual file
+            import glob
+            base = os.path.splitext(filename)[0]
+            files = glob.glob(f"{base}.*")
+            if files:
+                return files[0]
+        return None
+    except Exception as e:
+        print(f"Download error: {e}")
+        return None
 
-# test
-def do_downloading(user_data, user, update):
+# ==================== CONFIG ====================
+TOKEN = os.environ.get('BOT_TOKEN', '8832840308:AAERG8el8xWUhFGMivuEZiVAV42exmMMFNk')
+PORT = int(os.environ.get('PORT', 5000))
+WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
 
+# ==================== STATES ====================
+START_CO, GET_WORD, GET_NUMBER, GET_CHANNEL_URL, GET_URL, CONFIRMATION = range(1, 7)
+
+# ==================== KEYBOARDS ====================
+reply_keyboard_start = [
+    ['📥 Download entire channel'],
+    ['🔍 Download with searching word'],
+    ['📹 Download one video'],
+    ['📊 See processes'],
+    ['❌ Exit']
+]
+markup_start = ReplyKeyboardMarkup(reply_keyboard_start, resize_keyboard=True, one_time_keyboard=True)
+
+reply_keyboard_back = [['🔙 Back', '🏠 Home', '❌ Exit']]
+markup_back = ReplyKeyboardMarkup(reply_keyboard_back, resize_keyboard=True, one_time_keyboard=True)
+
+reply_keyboard_confirmation = [['✅ I confirm'], ['🏠 Home', '❌ Exit']]
+markup_confirmation = ReplyKeyboardMarkup(reply_keyboard_confirmation, resize_keyboard=True, one_time_keyboard=True)
+
+# ==================== HELPERS ====================
+def remake_folder(folder_name):
+    """Clean or create download folder"""
+    folder = f'Downloads/{folder_name}'
+    if os.path.exists(folder):
+        try:
+            shutil.rmtree(folder)
+        except:
+            pass
+    os.makedirs(folder, exist_ok=True)
+
+async def do_downloading(user_data, user, update):
+    """Download all videos in background thread"""
     for url in user_data['list_of_urls']:
         try:
             status = Download(url['url'], user.id)
             if status:
-                update.message.reply_video(video = open(status, 'rb'), caption = url['title'])
-                # os.remove(status)
+                try:
+                    with open(status, 'rb') as video:
+                        await update.message.reply_video(
+                            video=video,
+                            caption=url.get('title', 'Video')
+                        )
+                except:
+                    pass
+                try:
+                    os.remove(status)
+                except:
+                    pass
             else:
-                update.message.reply_text(f"could not download the video {url['url']}")
-                continue
-        except:
-            update.message.reply_text(f"could not download {url['url']}", reply_markup = ReplyKeyboardRemove())
+                await update.message.reply_text(f"❌ Failed: {url['url']}")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Error: {url['url']}")
             continue
 
-def how_many_thread_is_alive(update, context):
+def run_async_download(user_data, user, update, loop):
+    """Run async download in thread"""
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(do_downloading(user_data, user, update))
+
+# ==================== HANDLERS ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    remake_folder(str(user.id))
+    await update.message.reply_text(
+        f'👋 Welcome {user.first_name}!\nChoose an option:',
+        reply_markup=markup_start
+    )
+    return START_CO
+
+async def start_co(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text
+    remake_folder(str(user.id))
+
+    if 'entire channel' in text.lower():
+        await update.message.reply_text(
+            '🔗 Send URL of one video from the channel:',
+            reply_markup=markup_back
+        )
+        return GET_CHANNEL_URL
+
+    elif 'searching word' in text.lower():
+        await update.message.reply_text(
+            '🔤 Enter search word:',
+            reply_markup=markup_back
+        )
+        return GET_WORD
+
+    elif 'one video' in text.lower():
+        await update.message.reply_text(
+            '🔗 Send video link:',
+            reply_markup=markup_back
+        )
+        return GET_URL
+
+    elif 'processes' in text.lower():
+        return await see_processes(update, context)
+
+    elif 'home' in text.lower():
+        await update.message.reply_text('Choose an option:', reply_markup=markup_start)
+        return START_CO
+    
+    else:
+        await update.message.reply_text('Choose an option:', reply_markup=markup_start)
+        return START_CO
+
+async def get_channel_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = context.user_data
-
-    counter = 0
-    if user_data.get('thread'):
-        for i in user_data['thread']:
-            if i.is_alive():
-                counter += 1
-
-    update.message.reply_text(f'there is {counter} process is going.', reply_markup = markup_start)
-    return(START_CO)
-
-def confirmation(update, context):
-    user_data = context.user_data
-    user = update.message.from_user
     text = update.message.text
 
-    if text != 'I confirm':
-        update.message.reply_text('Choose ...', reply_markup = markup_start)
-        return(START_CO)
+    if text in ['🔙 Back', '🏠 Home']:
+        await update.message.reply_text('Choose an option:', reply_markup=markup_start)
+        return START_CO
 
-    t = threading.Thread(target=do_downloading, args=(user_data, user, update))
-    t.start()
-    user_data['thread'].append(t)
+    await update.message.reply_text('🔍 Finding channel...')
+    channel_id = find_channel_id(text)
+    
+    if channel_id:
+        await update.message.reply_text('📊 Getting video list...')
+        list_of_urls = get_videos_from_channel(channel_id)
+        if list_of_urls:
+            user_data['list_of_urls'] = list_of_urls
+            await update.message.reply_text(
+                f'📊 Found **{len(list_of_urls)}** videos.\n✅ Confirm download?',
+                reply_markup=markup_confirmation
+            )
+            return CONFIRMATION
+    
+    await update.message.reply_text('❌ Could not find channel!', reply_markup=markup_start)
+    return START_CO
 
+async def get_word_for_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data = context.user_data
+    text = update.message.text
 
-    update.message.reply_text('finish proces', reply_markup = markup_start)
-    return(START_CO)
+    if text in ['🔙 Back', '🏠 Home']:
+        await update.message.reply_text('Choose an option:', reply_markup=markup_start)
+        return START_CO
 
+    user_data['search_word'] = text
+    await update.message.reply_text(
+        '🔢 How many videos? (number only)',
+        reply_markup=markup_back
+    )
+    return GET_NUMBER
 
-def stop_conversation(update,context):
-    update.message.reply_text('goodbye' , reply_markup = ReplyKeyboardRemove())
-    return(ConversationHandler.END)
+async def get_number_of_videos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data = context.user_data
+    text = update.message.text
 
-def cancle(update,context):
-    update.message.reply_text('bye' , reply_markup = ReplyKeyboardRemove())
-    return(ConversationHandler.END)
+    if text in ['🔙 Back', '🏠 Home']:
+        await update.message.reply_text('Enter search word:', reply_markup=markup_back)
+        return GET_WORD
 
-def timeout(update, context):
-    user = update.message.from_user
+    try:
+        number = int(text)
+        if number > 50:
+            await update.message.reply_text('⚠️ Max 50 videos! Try again:')
+            return GET_NUMBER
+        
+        await update.message.reply_text(f'🔍 Searching for: **{user_data["search_word"]}**')
+        list_of_urls = find_videos_with_search(user_data['search_word'], number)
+        
+        if list_of_urls:
+            user_data['list_of_urls'] = list_of_urls
+            await update.message.reply_text(
+                f'📊 Found **{len(list_of_urls)}** videos.\n✅ Confirm download?',
+                reply_markup=markup_confirmation
+            )
+            return CONFIRMATION
+        else:
+            await update.message.reply_text('❌ No videos found!', reply_markup=markup_start)
+            return START_CO
+    
+    except ValueError:
+        await update.message.reply_text('❌ Please enter a number!')
+        return GET_NUMBER
+
+async def get_one_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text
+
+    if text in ['🔙 Back', '🏠 Home']:
+        await update.message.reply_text('Choose an option:', reply_markup=markup_start)
+        return START_CO
+
+    await update.message.reply_text('⬇️ Downloading video...')
+    
+    try:
+        status = Download(text, user.id)
+        if status:
+            try:
+                with open(status, 'rb') as video:
+                    await update.message.reply_video(
+                        video=video,
+                        reply_markup=markup_start
+                    )
+                os.remove(status)
+                return START_CO
+            except Exception as e:
+                await update.message.reply_text(f'❌ Upload failed: {e}', reply_markup=markup_start)
+                return START_CO
+        else:
+            await update.message.reply_text('❌ Download failed!', reply_markup=markup_start)
+            return START_CO
+    except Exception as e:
+        await update.message.reply_text(f'❌ Error: {e}', reply_markup=markup_start)
+        return START_CO
+
+async def confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_data = context.user_data
+    user = update.effective_user
+
+    if 'I confirm' not in update.message.text:
+        await update.message.reply_text('Choose an option:', reply_markup=markup_start)
+        return START_CO
+
+    await update.message.reply_text('⬇️ Starting downloads... This may take a while.')
+
+    # Run in thread to not block
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(
+        target=run_async_download,
+        args=(user_data, user, update, loop)
+    )
+    thread.start()
+
+    await update.message.reply_text('✅ Download started in background!', reply_markup=markup_start)
+    return START_CO
+
+async def see_processes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    active = threading.active_count() - 1  # minus main thread
+    await update.message.reply_text(
+        f'📊 Active threads: **{active}**',
+        reply_markup=markup_start
+    )
+    return START_CO
+
+async def stop_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('👋 Goodbye!', reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+async def timeout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     try:
         remake_folder(str(user.id))
     except:
         pass
+    await update.message.reply_text('⏰ Timeout! /start to begin again.', reply_markup=ReplyKeyboardRemove())
 
-    update.message.reply_text('the time is out.',reply_markup = ReplyKeyboardRemove())
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Error: {context.error}")
+    if update:
+        try:
+            await update.message.reply_text('❌ An error occurred. Please /start again.')
+        except:
+            pass
 
-def error(update,context):
-    print(update,context.error)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# info of bot and chanal
-bot = telegram.Bot(token=token)
-
+# ==================== MAIN ====================
 def main():
-    updater = Updater(token, use_context=True)
-    dp = updater.dispatcher
+    app = Application.builder().token(TOKEN).build()
 
-    # ---------------------------------------------->>>> User Bot Handler
-    conv_handler = ConversationHandler(
-        entry_points = [CommandHandler('start', start)],
-
-
-        states = states,
-
-        fallbacks = [CommandHandler('cancle', start), CommandHandler('start', start), MessageHandler(Filters.regex('^exit$'), stop_conversation),
-                    MessageHandler(Filters.regex('^🏠 home$'), start_co)],
-
-        conversation_timeout = 50000, 
-    )
-
-
-    dp.add_handler(conv_handler)
-
-    dp.add_error_handler(error)
-
-    print('trying to connect to telegram api ...')
-
-    updater.start_polling()
-    
-
-    # updater.start_webhook(listen='0.0.0.0',port=PORT,url_path=TOKEN)
-    # updater.bot.set_webhook('https://clashbazar.com/' + TOKEN )
-
-    print('connected to telegram api : 200 ')
-
-    updater.idle()
-
-
-
-def remake_folder(folder_name):
-
-    folder_name = f'Downloads/{folder_name}'        
-
-    if os.path.exists(folder_name):
-        for filename in os.listdir(folder_name):
-            file_path = os.path.join(folder_name, filename)
-            try:
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-            except Exception as e:
-                print('Failed to delete %s. Reason: %s' % (file_path, e))
-
-    else:
-        os.mkdir(folder_name)
-
-
-
-if __name__ == '__main__':
-
-
-    same = [CommandHandler('cancle', cancle), MessageHandler(Filters.regex('^exit$'), stop_conversation), MessageHandler(Filters.regex('^🏠 home$'), start)]
-
-
+    # States
     states = {
-            START_CO : [CommandHandler('start', start),
-                        MessageHandler(Filters.regex('^Download entire channel$'), start_co),
-                        MessageHandler(Filters.regex('^Download with searching word$'), start_co),
-                        MessageHandler(Filters.regex('^Download one video$'), start_co),
-                        MessageHandler(Filters.regex('^See processes$'), how_many_thread_is_alive),
-                        ],
-            
-            GET_WORD : same + [CommandHandler('start', start), MessageHandler(Filters.text , get_word_for_search)],
-
-            GET_NUMBER : same + [CommandHandler('start', start), MessageHandler(Filters.text , get_number_of_videos)],
-
-            GET_CHANNEL_URL : same + [CommandHandler('start', start), MessageHandler(Filters.text , get_channel_url)],
-
-            GET_URL : same + [CommandHandler('start', start), MessageHandler(Filters.text , one_video_download)],
-
-            CONFIRMATION : [CommandHandler('start', start), MessageHandler(Filters.regex('^I confirm$'), confirmation)],
-
-            
-
+        START_CO: [
+            MessageHandler(filters.Regex('(?i)entire channel'), start_co),
+            MessageHandler(filters.Regex('(?i)searching word'), start_co),
+            MessageHandler(filters.Regex('(?i)one video'), start_co),
+            MessageHandler(filters.Regex('(?i)processes'), see_processes),
+            MessageHandler(filters.Regex('(?i)home'), start_co),
+        ],
+        GET_WORD: [
+            MessageHandler(filters.Regex('(?i)(back|home)'), start_co),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, get_word_for_search),
+        ],
+        GET_NUMBER: [
+            MessageHandler(filters.Regex('(?i)(back|home)'), start_co),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, get_number_of_videos),
+        ],
+        GET_CHANNEL_URL: [
+            MessageHandler(filters.Regex('(?i)(back|home)'), start_co),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, get_channel_url),
+        ],
+        GET_URL: [
+            MessageHandler(filters.Regex('(?i)(back|home)'), start_co),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, get_one_video),
+        ],
+        CONFIRMATION: [
+            MessageHandler(filters.Regex('(?i)i confirm'), confirmation),
+            MessageHandler(filters.Regex('(?i)home'), start_co),
+        ],
     }
 
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states=states,
+        fallbacks=[
+            CommandHandler('start', start),
+            MessageHandler(filters.Regex('(?i)exit'), stop_conversation),
+            MessageHandler(filters.Regex('(?i)home'), start_co),
+        ],
+        conversation_timeout=300,
+    )
+
+    app.add_handler(conv_handler)
+    app.add_error_handler(error_handler)
+
+    print('🤖 Bot is running...')
+    
+    # Railway uses webhook or polling
+    if WEBHOOK_URL:
+        app.run_webhook(
+            listen='0.0.0.0',
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f'{WEBHOOK_URL}/{TOKEN}'
+        )
+    else:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
     main()
