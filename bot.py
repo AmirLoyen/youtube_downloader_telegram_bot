@@ -1,332 +1,233 @@
 import os
-import re
-import shutil
-import threading
-import asyncio
+import subprocess
 import glob
-import traceback
-
-# ==================== IMPORTS ====================
-try:
-    from telegram import Update, ReplyKeyboardRemove, ReplyKeyboardMarkup
-    from telegram.ext import (
-        Application,
-        CommandHandler,
-        MessageHandler,
-        ConversationHandler,
-        filters,
-        ContextTypes
-    )
-except ImportError:
-    print("❌ Install: pip install python-telegram-bot>=21.0")
-    exit(1)
-
-try:
-    import yt_dlp
-except ImportError:
-    print("❌ Install: pip install yt-dlp")
-    exit(1)
-
-try:
-    from pytube import Search
-except ImportError:
-    print("❌ Install: pip install pytube")
-    exit(1)
-
-try:
-    import scrapetube
-except ImportError:
-    print("⚠️ scrapetube not installed. Channel download disabled.")
-    scrapetube = None
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 # ==================== CONFIG ====================
-TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN_HERE')
-if TOKEN == 'YOUR_BOT_TOKEN_HERE':
-    print("❌ Please set BOT_TOKEN!")
-    exit(1)
-
-PORT = int(os.environ.get('PORT', 8080))
-WEBHOOK_URL = os.environ.get('WEBHOOK_URL', '')
+TOKEN = os.environ.get('BOT_TOKEN', 'YOUR_TOKEN')
+MAX_SIZE_MB = 2.5  # حداکثر حجم برای Video Message (حدود 2.5MB امنه)
+MAX_DURATION = 60   # حداکثر 60 ثانیه
 
 # ==================== STATES ====================
-(START_CO, GET_WORD, GET_NUMBER, GET_CHANNEL_URL, GET_URL, CONFIRMATION) = range(1, 7)
+WAITING_VIDEO = 1
 
-# ==================== KEYBOARDS ====================
-markup_start = ReplyKeyboardMarkup([
-    ['📥 Download Channel', '🔍 Search & Download'],
-    ['📹 Single Video', '📊 Active Downloads'],
-    ['❌ Cancel']
-], resize_keyboard=True)
-
-markup_back = ReplyKeyboardMarkup([
-    ['🔙 Back', '🏠 Home', '❌ Cancel']
-], resize_keyboard=True)
-
-markup_confirm = ReplyKeyboardMarkup([
-    ['✅ Confirm', '🏠 Home', '❌ Cancel']
-], resize_keyboard=True)
-
-# ==================== HELPERS ====================
-BASE_DIR = 'downloads'
-os.makedirs(BASE_DIR, exist_ok=True)
-
-def clean_folder(user_id):
-    folder = os.path.join(BASE_DIR, str(user_id))
-    if os.path.exists(folder):
-        try: shutil.rmtree(folder)
-        except: pass
-    os.makedirs(folder, exist_ok=True)
-    return folder
-
-# ==================== YOUTUBE ====================
-def get_channel_id(url):
+# ==================== FUNCTIONS ====================
+def convert_to_video_message(input_path, output_path):
+    """Convert video to Telegram video message format (round, 360x360, max 60s)"""
     try:
-        opts = {'quiet': True, 'extract_flat': True}
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-            return info.get('channel_id') or info.get('uploader_id')
-    except: return None
+        cmd = [
+            'ffmpeg', '-i', input_path,
+            '-vf', 'crop=min(iw\\,ih):min(iw\\,ih),scale=360:360,setsar=1',  # Crop to square + resize
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '30',               # Compression
+            '-maxrate', '500k',          # Low bitrate for small size
+            '-bufsize', '1M',
+            '-t', str(MAX_DURATION),     # Max 60 seconds
+            '-an',                       # Remove audio (video messages are silent)
+            '-y',                        # Overwrite
+            output_path
+        ]
+        subprocess.run(cmd, capture_output=True, check=True, timeout=120)
+        
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            size_mb = os.path.getsize(output_path) / (1024 * 1024)
+            if size_mb > MAX_SIZE_MB:
+                # Try harder compression
+                cmd2 = [
+                    'ffmpeg', '-i', input_path,
+                    '-vf', 'crop=min(iw\\,ih):min(iw\\,ih),scale=360:360,setsar=1',
+                    '-c:v', 'libx264',
+                    '-preset', 'veryfast',
+                    '-crf', '40',
+                    '-maxrate', '200k',
+                    '-bufsize', '500k',
+                    '-t', str(min(MAX_DURATION, 30)),
+                    '-an', '-y',
+                    output_path
+                ]
+                subprocess.run(cmd2, capture_output=True, timeout=120)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                return output_path
+    except Exception as e:
+        print(f"FFmpeg error: {e}")
+    return None
 
-def get_channel_videos(channel_id):
-    if not scrapetube: return None
+def get_video_duration(input_path):
+    """Get video duration in seconds"""
     try:
-        videos = scrapetube.get_channel(channel_id)
-        result = []
-        for v in videos:
-            vid = v.get('videoId', '')
-            title = 'Unknown'
-            try: title = v['title']['runs'][0]['text']
-            except: pass
-            if vid: result.append({'url': f'https://youtube.com/watch?v={vid}', 'title': title})
-        return result
-    except: return None
-
-def search_videos(query, limit=10):
-    try:
-        search = Search(query)
-        result = []
-        for i, video in enumerate(search.results):
-            if i >= limit: break
-            result.append({'url': video.watch_url, 'title': video.title or 'Unknown'})
-        return result
-    except: return None
-
-def download_video(url, user_id):
-    try:
-        folder = clean_folder(user_id)
-        opts = {
-            'format': 'best[height<=720][ext=mp4]/best[height<=720]/best',
-            'outtmpl': os.path.join(folder, '%(title).100s.%(ext)s'),
-            'quiet': True, 'no_warnings': True,
-            'merge_output_format': 'mp4',
-            'max_filesize': 1900000000,
-            'retries': 3, 'socket_timeout': 30,
-        }
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-        files = glob.glob(os.path.join(folder, '*'))
-        return max(files, key=os.path.getsize) if files else None
-    except: return None
-
-def background_download(loop, user_data, user_id, context):
-    asyncio.set_event_loop(loop)
-    
-    async def run():
-        videos = user_data.get('list_of_urls', [])
-        total = len(videos)
-        for i, v in enumerate(videos, 1):
-            try:
-                await context.bot.send_message(user_id, f'⬇️ {i}/{total}: {v["title"][:50]}...')
-                fp = download_video(v['url'], user_id)
-                if fp and os.path.exists(fp):
-                    if os.path.getsize(fp) < 1900000000:
-                        with open(fp, 'rb') as f:
-                            await context.bot.send_video(user_id, video=f, caption=v['title'][:200], supports_streaming=True)
-                    else:
-                        await context.bot.send_message(user_id, f'⚠️ Too large: {v["title"][:50]}')
-                    try: os.remove(fp)
-                    except: pass
-                else:
-                    await context.bot.send_message(user_id, f'❌ Failed: {v["title"][:50]}')
-            except:
-                pass
-        clean_folder(user_id)
-        await context.bot.send_message(user_id, f'✅ Done! {total} videos processed.')
-    
-    loop.run_until_complete(run())
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            input_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return float(result.stdout.strip())
+    except:
+        return 0
 
 # ==================== HANDLERS ====================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    clean_folder(user.id)
-    await update.message.reply_text(f'👋 Welcome {user.first_name}!\nChoose:', reply_markup=markup_start)
-    return START_CO
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        '📹 **Video → Video Message Converter**\n\n'
+        'Send me a video and I\'ll convert it to a round video message!\n\n'
+        '⚠️ Best results:\n'
+        '• Videos under 60 seconds\n'
+        '• Square videos work best\n'
+        '• Final size under 2.5MB'
+    )
+    return WAITING_VIDEO
 
-async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    text = update.message.text.lower()
-    clean_folder(user.id)
     
-    if 'channel' in text:
-        await update.message.reply_text('🔗 Send video URL from channel:', reply_markup=markup_back)
-        return GET_CHANNEL_URL
-    elif 'search' in text:
-        await update.message.reply_text('🔤 Search word:', reply_markup=markup_back)
-        return GET_WORD
-    elif 'single' in text:
-        await update.message.reply_text('🔗 Send YouTube URL:', reply_markup=markup_back)
-        return GET_URL
-    elif 'active' in text:
-        n = threading.active_count() - 1
-        await update.message.reply_text(f'📊 Active: {n}', reply_markup=markup_start)
-        return START_CO
-    elif 'cancel' in text:
-        return await cmd_cancel(update, context)
+    # Get video file
+    if update.message.video:
+        video = update.message.video
+        file_id = video.file_id
+    elif update.message.document and update.message.document.mime_type and 'video' in update.message.document.mime_type:
+        video = update.message.document
+        file_id = video.file_id
+    elif update.message.animation:
+        video = update.message.animation
+        file_id = video.file_id
     else:
-        await update.message.reply_text('Choose:', reply_markup=markup_start)
-        return START_CO
-
-async def channel_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text in ['🔙 Back', '🏠 Home', '❌ Cancel']:
-        await update.message.reply_text('🏠 Menu:', reply_markup=markup_start)
-        return START_CO
+        await update.message.reply_text('❌ Please send a video file!')
+        return WAITING_VIDEO
     
-    await update.message.reply_text('🔍 Finding...')
-    cid = get_channel_id(update.message.text)
-    if not cid:
-        await update.message.reply_text('❌ Not found!', reply_markup=markup_back)
-        return GET_CHANNEL_URL
+    # Check duration
+    duration = getattr(video, 'duration', 0)
+    if duration > 120:
+        await update.message.reply_text(
+            f'⚠️ Video is {duration}s long. Max 60s for video messages.\n'
+            'I\'ll trim it to 60 seconds.'
+        )
     
-    videos = get_channel_videos(cid)
-    if not videos:
-        await update.message.reply_text('❌ No videos!', reply_markup=markup_start)
-        return START_CO
+    # Download video
+    msg = await update.message.reply_text('⬇️ Downloading...')
     
-    context.user_data['list_of_urls'] = videos
-    await update.message.reply_text(f'📊 {len(videos)} videos. Confirm?', reply_markup=markup_confirm)
-    return CONFIRMATION
-
-async def search_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text in ['🔙 Back', '🏠 Home', '❌ Cancel']:
-        await update.message.reply_text('🏠 Menu:', reply_markup=markup_start)
-        return START_CO
-    
-    context.user_data['search_word'] = update.message.text
-    await update.message.reply_text(f'🔤 "{update.message.text}" - How many? (1-20)', reply_markup=markup_back)
-    return GET_NUMBER
-
-async def number(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text in ['🔙 Back', '🏠 Home', '❌ Cancel']:
-        await update.message.reply_text('🏠 Menu:', reply_markup=markup_start)
-        return START_CO
+    input_path = f'input_{user.id}.mp4'
+    output_path = f'output_{user.id}.mp4'
     
     try:
-        n = int(update.message.text)
-        if n < 1 or n > 20:
-            raise ValueError
-    except:
-        await update.message.reply_text('❌ Number 1-20:', reply_markup=markup_back)
-        return GET_NUMBER
+        # Download
+        file = await context.bot.get_file(file_id)
+        await file.download_to_drive(input_path)
+        
+        await msg.edit_text('🔄 Converting to video message...')
+        
+        # Convert
+        result = convert_to_video_message(input_path, output_path)
+        
+        if result and os.path.exists(result):
+            size_mb = os.path.getsize(result) / (1024 * 1024)
+            
+            if size_mb > MAX_SIZE_MB:
+                await msg.edit_text(f'⚠️ Result is {size_mb:.1f}MB. Telegram limit is 2.5MB.\nTry a shorter video!')
+            else:
+                await msg.edit_text('📤 Sending video message...')
+                
+                try:
+                    # Send as video note (round video message)
+                    with open(result, 'rb') as f:
+                        await update.message.reply_video_note(
+                            video_note=f,
+                            duration=min(int(duration), MAX_DURATION),
+                            length=360
+                        )
+                    await msg.delete()
+                except Exception as e:
+                    await msg.edit_text(f'❌ Upload failed! File might be too large.\n{str(e)[:100]}')
+        else:
+            await msg.edit_text('❌ Conversion failed! Make sure FFmpeg is installed.')
     
-    q = context.user_data.get('search_word', '')
-    await update.message.reply_text(f'🔍 Searching: {q}...')
-    videos = search_videos(q, n)
+    except Exception as e:
+        await msg.edit_text(f'❌ Error: {str(e)[:100]}')
     
-    if not videos:
-        await update.message.reply_text('❌ No results!', reply_markup=markup_start)
-        return START_CO
+    finally:
+        # Clean up
+        for path in [input_path, output_path]:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except:
+                pass
     
-    context.user_data['list_of_urls'] = videos
-    preview = '\n'.join([f'{i+1}. {v["title"][:50]}' for i, v in enumerate(videos[:5])])
-    await update.message.reply_text(f'📊 Results:\n{preview}\n\nConfirm {len(videos)} videos?', reply_markup=markup_confirm)
-    return CONFIRMATION
+    await update.message.reply_text('✅ Send another video or /start to reset.')
+    return WAITING_VIDEO
 
-async def single_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Convert photo to video message with simple animation"""
     user = update.effective_user
+    msg = await update.message.reply_text('🔄 Converting photo...')
     
-    if update.message.text in ['🔙 Back', '🏠 Home', '❌ Cancel']:
-        await update.message.reply_text('🏠 Menu:', reply_markup=markup_start)
-        return START_CO
+    input_path = f'photo_{user.id}.jpg'
+    output_path = f'photo_{user.id}.mp4'
     
-    if 'youtube.com' not in update.message.text and 'youtu.be' not in update.message.text:
-        await update.message.reply_text('❌ Invalid URL!', reply_markup=markup_back)
-        return GET_URL
-    
-    msg = await update.message.reply_text('⬇️ Downloading...')
-    fp = download_video(update.message.text, user.id)
-    
-    if fp and os.path.exists(fp):
-        try:
-            with open(fp, 'rb') as f:
-                await update.message.reply_video(video=f, reply_markup=markup_start, supports_streaming=True)
+    try:
+        # Download photo
+        photo = update.message.photo[-1]  # Largest size
+        file = await context.bot.get_file(photo.file_id)
+        await file.download_to_drive(input_path)
+        
+        # Create video from photo (zoom effect)
+        cmd = [
+            'ffmpeg', '-loop', '1', '-i', input_path,
+            '-vf', 'crop=min(iw\\,ih):min(iw\\,ih),scale=360:360,setsar=1,zoompan=z=\'min(zoom+0.0015\\,1.2)\':d=125:x=\'iw/2-(iw/zoom/2)\':y=\'ih/2-(ih/zoom/2)\'',
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '30',
+            '-t', '3',
+            '-an', '-y',
+            output_path
+        ]
+        subprocess.run(cmd, capture_output=True, timeout=30)
+        
+        if os.path.exists(output_path):
+            with open(output_path, 'rb') as f:
+                await update.message.reply_video_note(video_note=f, duration=3, length=360)
             await msg.delete()
-        except:
-            await msg.edit_text('❌ Upload failed!')
-        try: os.remove(fp)
-        except: pass
-    else:
-        await msg.edit_text('❌ Download failed!', reply_markup=markup_start)
-    return START_CO
+        else:
+            await msg.edit_text('❌ Conversion failed!')
+    
+    except Exception as e:
+        await msg.edit_text(f'❌ Error: {str(e)[:100]}')
+    
+    finally:
+        for p in [input_path, output_path]:
+            try:
+                if os.path.exists(p): os.remove(p)
+            except: pass
+    
+    return WAITING_VIDEO
 
-async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    
-    if 'confirm' not in update.message.text.lower():
-        await update.message.reply_text('🏠 Menu:', reply_markup=markup_start)
-        return START_CO
-    
-    videos = context.user_data.get('list_of_urls', [])
-    if not videos:
-        await update.message.reply_text('❌ No videos!', reply_markup=markup_start)
-        return START_CO
-    
-    await update.message.reply_text(f'⬇️ Downloading {len(videos)} videos in background...', reply_markup=markup_start)
-    
-    loop = asyncio.new_event_loop()
-    t = threading.Thread(target=background_download, args=(loop, context.user_data, user.id, context), daemon=True)
-    t.start()
-    return START_CO
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text('👋 Bye! /start', reply_markup=ReplyKeyboardRemove())
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('👋 Bye! /start')
     return ConversationHandler.END
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Error: {context.error}")
-    if update and hasattr(update, 'message') and update.message:
-        await update.message.reply_text('❌ Error! /start again')
 
 # ==================== MAIN ====================
 def main():
-    print('🤖 Starting...')
     app = Application.builder().token(TOKEN).build()
     
     conv = ConversationHandler(
-        entry_points=[CommandHandler('start', cmd_start)],
+        entry_points=[CommandHandler('start', start)],
         states={
-            START_CO: [MessageHandler(filters.TEXT & ~filters.COMMAND, menu)],
-            GET_CHANNEL_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, channel_url)],
-            GET_WORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_word)],
-            GET_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, number)],
-            GET_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, single_url)],
-            CONFIRMATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
+            WAITING_VIDEO: [
+                MessageHandler(filters.VIDEO | filters.Document.VIDEO | filters.ANIMATION, handle_video),
+                MessageHandler(filters.PHOTO, handle_photo),
+                CommandHandler('start', start),
+            ],
         },
-        fallbacks=[
-            CommandHandler('cancel', cmd_cancel),
-            CommandHandler('start', cmd_start),
-        ],
+        fallbacks=[CommandHandler('cancel', cancel)],
         conversation_timeout=600,
     )
     
     app.add_handler(conv)
-    app.add_error_handler(error_handler)
-    
-    print('✅ Ready!')
-    
-    if WEBHOOK_URL:
-        app.run_webhook(listen='0.0.0.0', port=PORT, webhook_url=f'{WEBHOOK_URL}/{TOKEN}')
-    else:
-        app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    print('✅ Video Note Converter Bot is running!')
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == '__main__':
     main()
