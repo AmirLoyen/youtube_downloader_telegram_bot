@@ -1,0 +1,6 @@
+telethon
+yt-dlp
+beautifulsoup4
+python-telegram-bot
+scrapetube
+pytube
